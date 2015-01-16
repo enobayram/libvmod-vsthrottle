@@ -1,3 +1,4 @@
 $Module vsthrottle 3 Throttling VMOD
 $Init init
 $Function BOOL is_denied(STRING, INT, DURATION)
+$Function BOOL is_denied_with_ban(STRING, INT, DURATION, INT, DURATION)

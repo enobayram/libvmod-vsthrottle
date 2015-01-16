@@ -20,6 +20,8 @@ struct tbucket {
 	double			period;
 	long			tokens;
 	long			capacity;
+	double			last_banned;
+	unsigned		rejected;
 	VRB_ENTRY(tbucket)	tree;
 };
 
@@ -64,6 +66,8 @@ tb_alloc(const unsigned char *digest, long limit, double period, double now) {
 	tb->period = period;
 	tb->tokens = limit;
 	tb->capacity = limit;
+	tb->last_banned = -1;
+	tb->rejected = 0;
 
 	return (tb);
 }
@@ -112,6 +116,8 @@ get_ts_now(const struct vrt_ctx *ctx) {
 	return (now);
 }
 
+#define MAX_POSSIBLE_REJECTED 1 << 31
+
 VCL_BOOL
 vmod_is_denied(const struct vrt_ctx *ctx, VCL_STRING key, VCL_INT limit,
     VCL_DURATION period) {
@@ -139,6 +145,61 @@ vmod_is_denied(const struct vrt_ctx *ctx, VCL_STRING key, VCL_INT limit,
 		b->tokens -= 1;
 		ret = 0;
 		b->last_used = now;
+		b->rejected = 0;
+	} else {
+		// The following limit is enforced in order to avoid an overflow
+		b->rejected = b->rejected < MAX_POSSIBLE_REJECTED ? 
+						b->rejected+1 : MAX_POSSIBLE_REJECTED;
+	}
+
+	v->gc_count++;
+	if (v->gc_count == GC_INTVL) {
+		run_gc(now, part);
+		v->gc_count = 0;
+	}
+
+	AZ(pthread_mutex_unlock(&v->mtx));
+	return (ret);
+}
+
+VCL_BOOL vmod_is_denied_with_ban(const struct vrt_ctx *ctx, VCL_STRING key, VCL_INT limit,
+	    VCL_DURATION period, VCL_INT reject_limit, VCL_DURATION ban_period) {
+	unsigned ret = 1;
+	struct tbucket *b;
+	double now = get_ts_now(ctx);
+	SHA256_CTX sctx;
+	struct vsthrottle *v;
+	unsigned char digest[DIGEST_LEN];
+	unsigned part;
+
+	if (!key)
+		return (1);
+
+	SHA256_Init(&sctx);
+	SHA256_Update(&sctx, key, strlen(key));
+	SHA256_Final(digest, &sctx);
+
+	part = digest[0] & N_PART_MASK;
+	v = &vsthrottle[part];
+	AZ(pthread_mutex_lock(&v->mtx));
+	b = get_bucket(digest, limit, period, now);
+	if(b->last_banned != -1 && now-b->last_banned < ban_period) {
+		ret=1; // Still banned
+	} else {
+		calc_tokens(b, now);
+		if (b->tokens > 0) {
+			b->tokens -= 1;
+			ret = 0;
+			b->last_used = now;
+			b->rejected = 0;
+		} else {
+			ret=1; // No more tokens left
+			if(b->rejected >= reject_limit) {
+				b->last_banned = now;
+			} else {
+				b->rejected = b->rejected < MAX_POSSIBLE_REJECTED ? b->rejected+1 : MAX_POSSIBLE_REJECTED;
+			}
+		}
 	}
 
 	v->gc_count++;
